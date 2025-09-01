@@ -1,125 +1,46 @@
-import os, json, time
+import os, requests, json
 from flask import Flask, request, jsonify, send_from_directory
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from difflib import SequenceMatcher
 
-# Config from env
-GOOGLE_DOC_ID = os.environ.get("GOOGLE_DOC_ID")
-SA_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")  # raw JSON string
-PORT = int(os.environ.get("PORT", 5000))
+app = Flask(__name__, static_folder="static")
 
-if not GOOGLE_DOC_ID or not SA_JSON:
-    raise RuntimeError("Set GOOGLE_DOC_ID and GOOGLE_SERVICE_ACCOUNT_JSON env vars before starting.")
+BIN_ID = os.environ.get("BIN_ID")      # JSONBin bin ID
+SECRET_KEY = os.environ.get("BIN_KEY") # JSONBin secret key
 
-# Init Google Docs client
-sa_info = json.loads(SA_JSON)
-SCOPES = ["https://www.googleapis.com/auth/documents"]
-credentials = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-docs_service = build("docs", "v1", credentials=credentials, cache_discovery=False)
+JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{BIN_ID}"
 
-app = Flask(__name__, static_folder="static", static_url_path="/static")
+def get_memory():
+    r = requests.get(f"{JSONBIN_URL}/latest", headers={"X-Master-Key": SECRET_KEY})
+    data = r.json()
+    return data["record"].get("memory", [])
 
-# In-memory memory of learned lines (reloaded at start from Docs)
-memory = []
-
-def load_memory_from_doc():
-    global memory
-    try:
-        doc = docs_service.documents().get(documentId=GOOGLE_DOC_ID).execute()
-        # Extract plain text by concatenating paragraph elements
-        body = doc.get("body", {}).get("content", [])
-        text = []
-        for el in body:
-            p = el.get("paragraph")
-            if not p: continue
-            for elem in p.get("elements", []):
-                seg_text = elem.get("textRun", {}).get("content")
-                if seg_text:
-                    text.append(seg_text)
-        full = "".join(text).strip()
-        # Our storage format: each learned entry is on its own line prefixed with timestamp
-        memory = [line for line in full.splitlines() if line.strip()]
-        app.logger.info(f"Loaded {len(memory)} entries from doc")
-    except Exception as e:
-        app.logger.warning(f"Could not load memory from doc: {e}")
-        memory = []
-
-def append_to_doc(text_to_append):
-    # Get doc to find endIndex
-    doc = docs_service.documents().get(documentId=GOOGLE_DOC_ID).execute()
-    body = doc.get("body", {}).get("content", [])
-    # default to index 1 if not available
-    try:
-        end_index = body[-1]["endIndex"]
-    except Exception:
-        end_index = 1
-    # Ensure newline before append
-    payload_text = ("\n" + text_to_append + "\n")
-    requests = [
-        {"insertText": {"location": {"index": end_index}, "text": payload_text}}
-    ]
-    docs_service.documents().batchUpdate(documentId=GOOGLE_DOC_ID, body={"requests": requests}).execute()
-
-def similarity(a, b):
-    return SequenceMatcher(None, a, b).ratio()
+def save_memory(memory_list):
+    r = requests.put(JSONBIN_URL, headers={"X-Master-Key": SECRET_KEY, "Content-Type":"application/json"}, 
+                     data=json.dumps({"memory": memory_list}))
+    return r.ok
 
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
 
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok", "memory_count": len(memory)})
-
-# Learn endpoint: receives JSON { "text": "..." }
 @app.route("/learn", methods=["POST"])
 def learn():
-    payload = request.get_json(force=True)
-    text = payload.get("text", "").strip()
-    if not text:
-        return jsonify({"ok": False, "error": "empty text"}), 400
+    data = request.json
+    text = data.get("text","").strip()
+    if not text: return jsonify({"ok":False,"error":"empty"}),400
+    mem = get_memory()
+    mem.append(text)
+    save_memory(mem)
+    return jsonify({"ok":True,"saved":text})
 
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-    entry = f"[{ts}] {text}"
-    try:
-        append_to_doc(entry)
-        memory.append(entry)
-        return jsonify({"ok": True, "saved": entry})
-    except Exception as e:
-        app.logger.exception("Failed to append to Google Doc")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-# Reply endpoint: receives JSON { "prompt": "..." }
 @app.route("/reply", methods=["POST"])
 def reply():
-    payload = request.get_json(force=True)
-    prompt = payload.get("prompt", "").strip()
-    if not prompt:
-        return jsonify({"ok": False, "error": "empty prompt"}), 400
-
-    if not memory:
-        return jsonify({"ok": True, "reply": "I don't know yet — teach me using learn mode."})
-
-    # Find best match using fast SequenceMatcher over lines
-    best_score = 0.0
-    best_entry = None
-    for entry in memory:
-        # compare the raw learned content (omit timestamp)
-        content = entry.split("] ", 1)[-1]
-        s = similarity(prompt, content)
-        if s > best_score:
-            best_score = s
-            best_entry = content
-
-    # If similarity low, fallback to echo + safe message
-    if best_score < 0.25:
-        reply_text = f"I didn't find a close match. I remember: \"{memory[-1].split('] ',1)[-1]}\" (tell me more!)"
-    else:
-        reply_text = best_entry
-
-    return jsonify({"ok": True, "reply": reply_text, "score": best_score})
+    data = request.json
+    prompt = data.get("prompt","").strip()
+    mem = get_memory()
+    if not mem:
+        return jsonify({"reply":"I don't know yet. Teach me first!"})
+    best = max(mem, key=lambda x: len(set(x.split()) & set(prompt.split())))
+    return jsonify({"reply": best})
 
 if __name__ == "__main__":
-    load_memory_from_doc()
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
