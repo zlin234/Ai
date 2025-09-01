@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ShyAI — Learn / Reply</title>
+  <style>
+    body{font-family:Arial;max-width:700px;margin:30px auto}
+    #mode {margin-bottom:12px}
+    textarea{width:100%;height:120px}
+    .btn{padding:8px 12px;margin-right:8px}
+    #result{white-space:pre-wrap;margin-top:12px;background:#f4f4f4;padding:10px;border-radius:6px}
+  </style>
+</head>
+<body>
+  <h2>ShyAI — Learn / Reply</h2>
+  <label id="mode">Mode:
+    <select id="modeSel">
+      <option value="learn">Learn</option>
+      <option value="reply">Reply</option>
+    </select>
+  </label>
+  <textarea id="text" placeholder="Type text to teach or a prompt to ask..."></textarea>
+  <div>
+    <button id="send" class="btn">Send</button>
+  </div>
+  <div id="result"></div>
+
+<script>
+async function send() {
+  const mode = document.getElementById('modeSel').value;
+  const txt = document.getElementById('text').value;
+  const url = mode === 'learn' ? '/learn' : '/reply';
+  const body = mode === 'learn' ? {text: txt} : {prompt: txt};
+  const res = await fetch(url, {
+    method:'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+  const j = await res.json();
+  document.getElementById('result').textContent = JSON.stringify(j, null, 2);
+}
+document.getElementById('send').onclick = send;
+</script>
+</body>
+</html>
