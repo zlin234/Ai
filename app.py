@@ -1,125 +1,78 @@
-import os, json, time
-from flask import Flask, request, jsonify, send_from_directory
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from difflib import SequenceMatcher
+import json
+import torch
+import torch.nn as nn
+import tkinter as tk
+from collections import Counter
+from torch.nn.functional import one_hot
 
-# Config from env
-GOOGLE_DOC_ID = os.environ.get("GOOGLE_DOC_ID")
-SA_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")  # raw JSON string
-PORT = int(os.environ.get("PORT", 5000))
+# Load data
+with open("data.json", "r") as f:
+    phrases = json.load(f)
 
-if not GOOGLE_DOC_ID or not SA_JSON:
-    raise RuntimeError("Set GOOGLE_DOC_ID and GOOGLE_SERVICE_ACCOUNT_JSON env vars before starting.")
+# Build vocab
+tokens = [word for phrase in phrases for word in phrase.split()]
+vocab = {word: i for i, word in enumerate(set(tokens))}
+reverse_vocab = {i: word for word, i in vocab.items()}
+vocab_size = len(vocab)
 
-# Init Google Docs client
-sa_info = json.loads(SA_JSON)
-SCOPES = ["https://www.googleapis.com/auth/documents"]
-credentials = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-docs_service = build("docs", "v1", credentials=credentials, cache_discovery=False)
+# Encode data
+def encode(phrase):
+    return [vocab[word] for word in phrase.split() if word in vocab]
 
-app = Flask(__name__, static_folder="static", static_url_path="/static")
+encoded_data = [encode(p) for p in phrases]
 
-# In-memory memory of learned lines (reloaded at start from Docs)
-memory = []
+# Model
+class TinyModel(nn.Module):
+    def __init__(self, vocab_size, embed_dim=16):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim)
+        self.rnn = nn.GRU(embed_dim, embed_dim, batch_first=True)
+        self.fc = nn.Linear(embed_dim, vocab_size)
 
-def load_memory_from_doc():
-    global memory
-    try:
-        doc = docs_service.documents().get(documentId=GOOGLE_DOC_ID).execute()
-        # Extract plain text by concatenating paragraph elements
-        body = doc.get("body", {}).get("content", [])
-        text = []
-        for el in body:
-            p = el.get("paragraph")
-            if not p: continue
-            for elem in p.get("elements", []):
-                seg_text = elem.get("textRun", {}).get("content")
-                if seg_text:
-                    text.append(seg_text)
-        full = "".join(text).strip()
-        # Our storage format: each learned entry is on its own line prefixed with timestamp
-        memory = [line for line in full.splitlines() if line.strip()]
-        app.logger.info(f"Loaded {len(memory)} entries from doc")
-    except Exception as e:
-        app.logger.warning(f"Could not load memory from doc: {e}")
-        memory = []
+    def forward(self, x):
+        x = self.embed(x)
+        out, _ = self.rnn(x)
+        return self.fc(out)
 
-def append_to_doc(text_to_append):
-    # Get doc to find endIndex
-    doc = docs_service.documents().get(documentId=GOOGLE_DOC_ID).execute()
-    body = doc.get("body", {}).get("content", [])
-    # default to index 1 if not available
-    try:
-        end_index = body[-1]["endIndex"]
-    except Exception:
-        end_index = 1
-    # Ensure newline before append
-    payload_text = ("\n" + text_to_append + "\n")
-    requests = [
-        {"insertText": {"location": {"index": end_index}, "text": payload_text}}
-    ]
-    docs_service.documents().batchUpdate(documentId=GOOGLE_DOC_ID, body={"requests": requests}).execute()
+model = TinyModel(vocab_size)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+loss_fn = nn.CrossEntropyLoss()
 
-def similarity(a, b):
-    return SequenceMatcher(None, a, b).ratio()
+# Train
+for epoch in range(100):
+    for seq in encoded_data:
+        inputs = torch.tensor(seq[:-1]).unsqueeze(0)
+        targets = torch.tensor(seq[1:])
+        outputs = model(inputs)[0]
+        loss = loss_fn(outputs, targets)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
 
-@app.route("/")
-def index():
-    return send_from_directory("static", "index.html")
+# Generate
+def generate(prompt, max_len=10):
+    tokens = encode(prompt)
+    for _ in range(max_len):
+        input_tensor = torch.tensor(tokens).unsqueeze(0)
+        output = model(input_tensor)[0][-1]
+        next_token = output.argmax().item()
+        tokens.append(next_token)
+    return ' '.join([reverse_vocab[t] for t in tokens])
 
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok", "memory_count": len(memory)})
+# UI
+def on_generate():
+    prompt = entry.get()
+    result = generate(prompt)
+    output_label.config(text=result)
 
-# Learn endpoint: receives JSON { "text": "..." }
-@app.route("/learn", methods=["POST"])
-def learn():
-    payload = request.get_json(force=True)
-    text = payload.get("text", "").strip()
-    if not text:
-        return jsonify({"ok": False, "error": "empty text"}), 400
+root = tk.Tk()
+root.title("Your Local AI")
 
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-    entry = f"[{ts}] {text}"
-    try:
-        append_to_doc(entry)
-        memory.append(entry)
-        return jsonify({"ok": True, "saved": entry})
-    except Exception as e:
-        app.logger.exception("Failed to append to Google Doc")
-        return jsonify({"ok": False, "error": str(e)}), 500
+entry = tk.Entry(root, width=50)
+entry.pack()
 
-# Reply endpoint: receives JSON { "prompt": "..." }
-@app.route("/reply", methods=["POST"])
-def reply():
-    payload = request.get_json(force=True)
-    prompt = payload.get("prompt", "").strip()
-    if not prompt:
-        return jsonify({"ok": False, "error": "empty prompt"}), 400
+tk.Button(root, text="Generate", command=on_generate).pack()
+output_label = tk.Label(root, text="", wraplength=400)
+output_label.pack()
 
-    if not memory:
-        return jsonify({"ok": True, "reply": "I don't know yet — teach me using learn mode."})
-
-    # Find best match using fast SequenceMatcher over lines
-    best_score = 0.0
-    best_entry = None
-    for entry in memory:
-        # compare the raw learned content (omit timestamp)
-        content = entry.split("] ", 1)[-1]
-        s = similarity(prompt, content)
-        if s > best_score:
-            best_score = s
-            best_entry = content
-
-    # If similarity low, fallback to echo + safe message
-    if best_score < 0.25:
-        reply_text = f"I didn't find a close match. I remember: \"{memory[-1].split('] ',1)[-1]}\" (tell me more!)"
-    else:
-        reply_text = best_entry
-
-    return jsonify({"ok": True, "reply": reply_text, "score": best_score})
-
-if __name__ == "__main__":
-    load_memory_from_doc()
-    app.run(host="0.0.0.0", port=PORT)
+root.mainloop()
